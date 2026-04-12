@@ -16,4 +16,4 @@ In the systemctl_services directory, you'll find the two current .service files.
 
 *The heatmap generation and crowding assesment are not yet included in the cv_monitor script i think, but they should. Every 2 days, a crowding assesment is perfomed, and i think it is best if this is written to the device_control table in the DB. We'll add one column, e.g. crowding_assesment, and each time the RP does the assemsent, the value is written to this cell. This means we don't keep a history of the crowding, but only know the most recent result, but I think that is fine.
 
-*I think automation should be a
+*I think automation should be part of the main loop of sensor_station.py, but maybe it is easier if we keep it appart... Anyways, we'll have to add some things to db_utils.py for updating and reading device_control table in the DB.
