@@ -4,11 +4,12 @@ import numpy as np
 import os
 from datetime import datetime
 from ultralytics import solutions
+import db_utils as db
 
 # --- Configuration ---
-CHICKEN_MODEL_PATH  = "/home/projectwork/MONITORING/CV/chick_model.pt"
-FRAME_SAVE_DIR      = "/home/projectwork/monitoring test file"
-OUTPUT_DIR          = "/home/projectwork/monitoring test file"
+CHICKEN_MODEL_PATH  = "/home/projectwork/colson_bundle/CV/geese_ducks_labelled.pt"
+FRAME_SAVE_DIR      = "/home/projectwork/colson_bundle/CV/saved_frames"
+OUTPUT_DIR          = "/home/projectwork/colson_bundle/CV/Heatmap_output"
 CSV_LOG_PATH        = os.path.join(FRAME_SAVE_DIR, "counts.csv")
 GRID_ROWS           = 3
 GRID_COLS           = 3
@@ -16,13 +17,14 @@ LOW_THRESHOLD       = 0.33
 MEDIUM_THRESHOLD    = 0.66
 
 # --- Coop & welfare configuration ---
-COOP_AREA_M2        = 10.0      # Total floor area of the coop in m²
+COOP_AREA_M2        = 0.68      # Total floor area of the coop in m²
 AVG_WEIGHT_KG       = 2.0       # Average weight per chicken in kg
 MAX_DENSITY_KG_M2   = 33.0      # EU legal maximum (33 kg/m²)
 WELFARE_DENSITY     = 30.0      # Better Chicken Commitment recommendation (30 kg/m²)
 
 # --- Pixel-based usage configuration ---
 OCCUPANCY_THRESHOLD = 0.05      # Pixels below this fraction of max are considered unoccupied
+
 
 def classify_occupancy(value, max_val):
     ratio = value / max_val if max_val > 0 else 0
@@ -32,8 +34,8 @@ def classify_occupancy(value, max_val):
         return "MEDIUM"
     else:
         return "HIGH"
-        
-        
+
+
 def crowding():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -41,8 +43,8 @@ def crowding():
     avg_chicken_count = None
     if os.path.exists(CSV_LOG_PATH):
         with open(CSV_LOG_PATH, "r") as f:
-            reader = csv.DictReader(f)
-            counts = [int(row["chicken_count"]) for row in reader]
+            reader = csv.reader(f)
+            counts = [int(row[0]) for row in reader]
         if counts:
             avg_chicken_count = sum(counts) / len(counts)
             print(f"Average chicken count from logs: {avg_chicken_count:.1f}")
@@ -58,7 +60,6 @@ def crowding():
 
     if not frame_files:
         print("No frames found in save directory. Exiting.")
-        exit()
         return None
 
     print(f"Found {len(frame_files)} frames to process.")
@@ -127,6 +128,11 @@ def crowding():
     effective_area  = usage_ratio * COOP_AREA_M2
 
     # --- Overcrowding assessment ---
+    verdict           = "UNKNOWN"
+    total_weight      = 0
+    effective_density = 0
+    total_density     = 0
+
     if avg_chicken_count is not None:
         total_weight      = avg_chicken_count * AVG_WEIGHT_KG
         effective_density = total_weight / effective_area if effective_area > 0 else 0
@@ -138,7 +144,6 @@ def crowding():
             verdict = "ACCEPTABLE - within EU legal limit but above welfare recommendation"
         else:
             verdict = "OVERCROWDED - exceeds EU legal maximum of 33 kg/m²"
-
 
     # --- Build report ---
     report_lines = []
@@ -192,11 +197,27 @@ def crowding():
         f.write(report_text)
     print(f"\nReport saved to {report_path}")
 
+    # --- Write verdict to database ---
+    if avg_chicken_count is not None:
+        try:
+            row_id = db.insert_heatmap_report(
+                crowding_verdict=verdict,
+            )
+            print(f"[DB] Crowding verdict written to database (row {row_id})")
+        except Exception as e:
+            print(f"[DB] Failed to write to database: {e}")
+    else:
+        print("[DB] Skipping database write — no chicken count available.")
+
     # --- Clear processed frames and CSV ---
     print("\nCleaning up processed frames...")
     for filename in frame_files:
         os.remove(os.path.join(FRAME_SAVE_DIR, filename))
     os.remove(CSV_LOG_PATH)
     print(f"Removed {len(frame_files)} frames and counts.csv from {FRAME_SAVE_DIR}")
-    
+
     return verdict
+
+
+if __name__ == "__main__":
+    crowding()

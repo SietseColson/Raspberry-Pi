@@ -22,22 +22,26 @@ from datetime import datetime
 # =============================================================================
 
 # Path to YOLO model files (relative to this script's directory)
-CHICKEN_MODEL_PATH   = "CV/chick_model.pt"
-EGG_MODEL_PATH       = "CV/egg_detection_model_1.pt"
+CHICKEN_MODEL_PATH   = "CV/chick_model.pt" # moet denk ik zijn: CV/chicken_model_test_val_90_10.pt
+EGG_MODEL_PATH       = "CV/egg_detection_model_1.pt" # moet denk ik zijn: CV/Egg_detection_model1.pt
 
 # How often to capture and analyse a frame (seconds)
-SCAN_INTERVAL_SECONDS = 60
+SCAN_INTERVAL_SECONDS = 600
 
 # Only count a detection run as valid when at least this many chickens
 # are visible — avoids writing zeros caused by a blocked camera view.
-MIN_CHICKENS_VISIBLE = 1
+MIN_CHICKENS_VISIBLE = 0
 
 # Active monitoring hours (24h). Outside these hours the service sleeps.
-MONITORING_HOUR_START = 7
-MONITORING_HOUR_END   = 19
+MONITORING_HOUR_START = 0  # change back to 7
+MONITORING_HOUR_END   = 24 # change back to 19
 
 # Camera index (0 = first/default camera on the Pi)
 DEFAULT_CAMERA_INDEX  = 0
+
+# Directory to save frames for heatmap generation
+FRAME_SAVE_DIR        = "/home/projectwork/colson_bundle/CV/saved_frames"
+
 
 # =============================================================================
 # CORE PIPELINE: DETECTION
@@ -74,16 +78,18 @@ def open_camera(index: int):
 def detect_counts(cap, chicken_model, egg_model):
     """
     Grab one frame and run both YOLO models.
-    Returns (chickens: int, eggs: int) or raises RuntimeError on read failure.
+    Returns (chickens: int, eggs: int, frame) or raises RuntimeError on read failure.
     """
     import cv2
     ret, frame = cap.read()
     if not ret:
         raise RuntimeError("Failed to read frame from camera.")
 
+    frame = cv2.rotate(frame, cv2.ROTATE_180)
+
     chickens = len(chicken_model(frame, verbose=False)[0].boxes)
     eggs     = len(egg_model(frame,     verbose=False)[0].boxes)
-    return chickens, eggs
+    return chickens, eggs, frame
 
 
 # =============================================================================
@@ -106,9 +112,14 @@ def counts_changed(new_chickens: int, new_eggs: int, prev) -> bool:
 # =============================================================================
 
 def main(camera_index: int = DEFAULT_CAMERA_INDEX) -> None:
+    import cv2
+    import os
     import db_utils as db
 
     db.setup_database()
+
+    # Ensure the frame save directory exists for heatmap generation.
+    os.makedirs(FRAME_SAVE_DIR, exist_ok=True)
 
     chicken_model, egg_model = load_models()
     cap = open_camera(camera_index)
@@ -135,7 +146,7 @@ def main(camera_index: int = DEFAULT_CAMERA_INDEX) -> None:
 
             # Capture + detect
             try:
-                chickens, eggs = detect_counts(cap, chicken_model, egg_model)
+                chickens, eggs, frame = detect_counts(cap, chicken_model, egg_model)
             except RuntimeError as exc:
                 print(f"[CV] Detection error: {exc}. Retrying in 10s.")
                 time.sleep(10)
@@ -144,7 +155,14 @@ def main(camera_index: int = DEFAULT_CAMERA_INDEX) -> None:
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             print(f"[CV] [{ts}] chickens={chickens}, eggs={eggs}", end="")
 
-            # Only write when something changed
+            # NEW: save frame for heatmap if at least one chicken detected
+            if chickens >= 1:
+                filename  = now.strftime("%Y%m%d_%H%M%S") + ".jpg"
+                save_path = os.path.join(FRAME_SAVE_DIR, filename)
+                cv2.imwrite(save_path, frame)
+                print(f"  → frame saved: {filename}", end="")
+
+            # Only write to DB when something changed
             if chickens < MIN_CHICKENS_VISIBLE:
                 print(f"  → skipped (chickens < {MIN_CHICKENS_VISIBLE}, likely blocked view)")
             elif counts_changed(chickens, eggs, prev_counts):
@@ -159,7 +177,6 @@ def main(camera_index: int = DEFAULT_CAMERA_INDEX) -> None:
     except KeyboardInterrupt:
         print("\n[CV] Stopped by user.")
     finally:
-        import cv2
         cap.release()
         cv2.destroyAllWindows()
         print("[CV] Camera released.")
@@ -173,7 +190,6 @@ def run_self_test() -> None:
     """Dry-run without camera or DB. Just validates logic."""
     print("=== CV monitor self-test ===")
 
-    # Simulate two identical readings then a change
     scenarios = [
         (12, 3,  None,         True,  "first ever reading → should write"),
         (12, 3,  (12, 3),      False, "same as before → should NOT write"),

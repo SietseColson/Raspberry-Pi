@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS cv_counts_colson (
 CREATE INDEX IF NOT EXISTS idx_cv_colson_timestamp ON cv_counts_colson(timestamp DESC);
 """
 
+CREATE_HEATMAP_REPORTS_SQL = """
+CREATE TABLE IF NOT EXISTS heatmap_reports_colson (
+    id               SERIAL PRIMARY KEY,
+    timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    crowding_verdict TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_heatmap_colson_timestamp ON heatmap_reports_colson(timestamp DESC);
+"""
+
 
 def setup_database():
     conn = get_db_connection()
@@ -88,6 +98,7 @@ def setup_database():
         cursor = conn.cursor()
         cursor.execute(CREATE_SENSOR_READINGS_SQL)
         cursor.execute(CREATE_CV_COUNTS_SQL)
+        cursor.execute(CREATE_HEATMAP_REPORTS_SQL)
         cursor.execute(CREATE_DEVICE_CONTROL_SQL)
         conn.commit()
         cursor.close()
@@ -233,6 +244,56 @@ def get_latest_cv_count() -> Optional[Tuple[int, int]]:
         if row is None:
             return None
         return (row["number_of_chickens"], row["egg_count"])
+    finally:
+        release_db_connection(conn)
+
+
+def insert_heatmap_report(crowding_verdict: str) -> int:
+    """
+    Insert a new row into heatmap_reports_colson.
+    Only writes the crowding verdict.
+    Returns the new row id.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO heatmap_reports_colson (timestamp, crowding_verdict)
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (datetime.now(), crowding_verdict),
+        )
+        row_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        return row_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)
+
+
+def get_latest_heatmap_report() -> Optional[Dict]:
+    """
+    Return the most recent heatmap report row as a dict, or None if empty.
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(
+            """
+            SELECT *
+            FROM heatmap_reports_colson
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return dict(row) if row else None
     finally:
         release_db_connection(conn)
 
