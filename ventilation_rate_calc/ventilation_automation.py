@@ -431,6 +431,31 @@ def compute_fan_rate(
     return rate, " | ".join(notes) if notes else "baseline"
 
 
+def map_rate_to_pwm_pct(
+    rate_m3h: float,
+    off_threshold: float = 50.0,
+    min_rate: float = 50.0,
+    max_rate: float = 150.0,
+    min_pct: float = 50.0,
+    max_pct: float = 100.0,
+) -> float:
+    """Map a ventilation rate to a PWM fan percentage.
+
+    - <= off_threshold -> 0%
+    - 50-150 m3/h -> 50-100%
+    - >= 150 m3/h -> 100%
+    """
+    if rate_m3h <= off_threshold:
+        return 0.0
+    if rate_m3h >= max_rate:
+        return max_pct
+
+    scaled = min_pct + (
+        (rate_m3h - min_rate) / (max_rate - min_rate)
+    ) * (max_pct - min_pct)
+    return round(max(min_pct, min(max_pct, scaled)), 1)
+
+
 def load_state() -> tuple[float, bool]:
     """Load the previous fan state from disk."""
     if STATE_FILE.exists():

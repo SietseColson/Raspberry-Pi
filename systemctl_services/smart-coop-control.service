@@ -1,0 +1,18 @@
+[Unit]
+Description=Colson Smart Coop Control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=projectwork
+WorkingDirectory=/home/projectwork/colson_bundle
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/projectwork/colson_bundle/.venv/bin/python -u /home/projectwork/colson_bundle/ventilation_rate_calc/smart_coop_control.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

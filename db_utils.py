@@ -51,6 +51,24 @@ CREATE INDEX IF NOT EXISTS idx_sensor_colson_timestamp ON sensor_readings_colson
 """
 
 
+# Device control table (for automation: door, feeder, fan, etc.)
+CREATE_DEVICE_CONTROL_SQL = """
+CREATE TABLE IF NOT EXISTS device_control (
+    id INTEGER PRIMARY KEY,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fan_auto BOOLEAN DEFAULT TRUE,
+    fan_speed_pct FLOAT DEFAULT 0,
+    fan_override_pct FLOAT,
+    fan_status_pct FLOAT DEFAULT 0,
+    door_auto BOOLEAN DEFAULT TRUE,
+    door_target TEXT DEFAULT 'open',
+    door_status TEXT DEFAULT 'closed',
+    feeder_auto BOOLEAN DEFAULT TRUE,
+    feeder_target TEXT DEFAULT 'open',
+    feeder_status TEXT DEFAULT 'closed'
+);
+"""
+
 # Future table (not used by sensor pipeline yet)
 CREATE_CV_COUNTS_SQL = """
 CREATE TABLE IF NOT EXISTS cv_counts_colson (
@@ -70,9 +88,36 @@ def setup_database():
         cursor = conn.cursor()
         cursor.execute(CREATE_SENSOR_READINGS_SQL)
         cursor.execute(CREATE_CV_COUNTS_SQL)
+        cursor.execute(CREATE_DEVICE_CONTROL_SQL)
         conn.commit()
         cursor.close()
-        print("[DB] Tables ready: sensor_readings_colson + cv_counts_colson")
+        print("[DB] Tables ready: sensor_readings_colson + cv_counts_colson + device_control")
+        
+        # Initialize device_control with default row if not present
+        init_device_control()
+    finally:
+        release_db_connection(conn)
+
+
+def init_device_control():
+    """Initialize the device_control table with default row if empty."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM device_control WHERE id = 1")
+        if cursor.fetchone() is None:
+            cursor.execute("""
+                INSERT INTO device_control
+                (id, fan_auto, fan_speed_pct, fan_override_pct, fan_status_pct,
+                 door_auto, door_target, door_status,
+                 feeder_auto, feeder_target, feeder_status)
+                VALUES (1, TRUE, 0, NULL, 0, TRUE, 'open', 'closed', TRUE, 'open', 'closed')
+            """)
+        cursor.close()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] Error initializing device_control: {exc}")
     finally:
         release_db_connection(conn)
 
@@ -223,5 +268,66 @@ def get_latest_sensor_reading() -> Optional[Dict]:
         row = cursor.fetchone()
         cursor.close()
         return dict(row) if row else None
+    finally:
+        release_db_connection(conn)
+
+
+# =============================================================================
+# DEVICE CONTROL (Automation: door, feeder, fan state)
+# =============================================================================
+
+VALID_UPDATE_COLUMNS = {
+    "fan_auto", "fan_speed_pct", "fan_override_pct", "fan_status_pct",
+    "door_auto", "door_target", "door_status",
+    "feeder_auto", "feeder_target", "feeder_status",
+}
+
+
+def fetch_device_control() -> Optional[Dict]:
+    """Fetch the current device control state (row with id=1)."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM device_control WHERE id = 1")
+        row = cursor.fetchone()
+        cursor.close()
+        return dict(row) if row else None
+    finally:
+        release_db_connection(conn)
+
+
+def update_device_control(**kwargs) -> bool:
+    """
+    Update device control columns safely.
+    Only allows updates to valid columns (defined in VALID_UPDATE_COLUMNS).
+    Returns True on success, False on failure.
+    """
+    if not kwargs:
+        return False
+
+    # Validate column names
+    invalid = [k for k in kwargs if k not in VALID_UPDATE_COLUMNS]
+    if invalid:
+        print(f"[DB] Invalid columns in update_device_control: {invalid}")
+        return False
+
+    cols = ", ".join([f"{k} = %s" for k in kwargs])
+    vals = list(kwargs.values())
+    vals.append(1)  # WHERE id = 1
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE device_control SET {cols}, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            vals
+        )
+        cursor.close()
+        conn.commit()
+        return True
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] Error updating device_control: {exc}")
+        return False
     finally:
         release_db_connection(conn)

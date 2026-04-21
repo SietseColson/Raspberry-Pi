@@ -14,6 +14,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from ventilation_automation import (
     Fan,
@@ -25,7 +27,9 @@ from ventilation_automation import (
     read_bird_count,
     read_weather,
     save_state,
+    map_rate_to_pwm_pct,
 )
+import db_utils
 from risk_calculation import (
     compute_current_heat_risk_from_readings,
     compute_current_mold_risk_from_state,
@@ -293,6 +297,9 @@ def main() -> None:
         prev_rate=prev_rate,
         initialised=initialised,
     )
+    fan_pct = map_rate_to_pwm_pct(rate)
+    if not db_utils.update_device_control(fan_speed_pct=fan_pct):
+        log.warning("Failed to write fan_speed_pct %.1f%% to device_control", fan_pct)
 
     write_risk_snapshot(
         client,
