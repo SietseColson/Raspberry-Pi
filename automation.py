@@ -31,7 +31,7 @@ LOCAL_TZ = pytz.timezone("Europe/Brussels")
 POLL_SECONDS = 5
 
 # Motor timing (seconds)
-DOOR_TIMEOUT_SECONDS = 70
+DOOR_TIMEOUT_SECONDS = 75
 FEEDER_OPEN_SECONDS = 8
 FEEDER_CLOSE_SECONDS = 8
 
@@ -75,7 +75,7 @@ feeder_motor = Motor(forward=20, backward=21)
 
 # Fan control on H-bridge A (no reverse)
 """Fan motor on H-bridge A: IN1=23, IN2=24, EN=25."""
-fan_motor = Motor(forward=23, backward=24, enable=25)
+fan_motor = Motor(forward=23, backward=24, enable=25, pwm_frequency=10000)
 
 # Predator alarm (LED)
 predator_led = LED(22)

@@ -436,13 +436,13 @@ def map_rate_to_pwm_pct(
     off_threshold: float = 50.0,
     min_rate: float = 50.0,
     max_rate: float = 150.0,
-    min_pct: float = 50.0,
+    min_pct: float = 30.0,
     max_pct: float = 100.0,
 ) -> float:
     """Map a ventilation rate to a PWM fan percentage.
 
     - <= off_threshold -> 0%
-    - 50-150 m3/h -> 50-100%
+    - 50-150 m3/h -> 30-100%
     - >= 150 m3/h -> 100%
     """
     if rate_m3h <= off_threshold:
