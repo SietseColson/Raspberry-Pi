@@ -357,7 +357,6 @@ def build_window_result(window: WindowAccumulator) -> Dict:
     waterer_pct = round(drinker_status(avg_u2_cm / 100.0), 2)
 
     result = {
-        "timestamp": window.last_timestamp,
         "temperature_c": avg_t,
         "humidity_pct": avg_h,
         "feeder_pct": feeder_pct,
