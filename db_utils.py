@@ -111,19 +111,19 @@ def setup_database():
 
 
 def init_device_control():
-    """Initialize the device_control table with default row if empty."""
+    """Initialize the device_control table with default row if empty.
+    Uses INSERT...ON CONFLICT to be safely idempotent even with concurrent calls."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM device_control WHERE id = 1")
-        if cursor.fetchone() is None:
-            cursor.execute("""
-                INSERT INTO device_control
-                (id, fan_auto, fan_speed_pct, fan_override_pct, fan_status_pct,
-                 door_auto, door_target, door_status,
-                 feeder_auto, feeder_target, feeder_status)
-                VALUES (1, TRUE, 0, NULL, 0, TRUE, 'open', 'closed', TRUE, 'open', 'closed')
-            """)
+        cursor.execute("""
+            INSERT INTO device_control
+            (id, fan_auto, fan_speed_pct, fan_override_pct, fan_status_pct,
+             door_auto, door_target, door_status,
+             feeder_auto, feeder_target, feeder_status)
+            VALUES (1, TRUE, 0, NULL, 0, TRUE, 'open', 'closed', TRUE, 'open', 'closed')
+            ON CONFLICT (id) DO NOTHING
+        """)
         cursor.close()
         conn.commit()
     except Exception as exc:
