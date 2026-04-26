@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ventilation calculation every 5 minutes
+Requires=ventilation-simple.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

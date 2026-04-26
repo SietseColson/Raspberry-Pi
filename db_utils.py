@@ -1,20 +1,42 @@
 import atexit
+import os
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = "postgresql://postgres.qdwofrcncjnhstbqegnj:Vg4Zc6Z!_tLKtMj@aws-1-eu-west-1.pooler.supabase.com:6543/postgres"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres.qdwofrcncjnhstbqegnj:Vg4Zc6Z!_tLKtMj@aws-1-eu-west-1.pooler.supabase.com:6543/postgres",
+)
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 
-_pool = psycopg2.pool.SimpleConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
-print("[DB] Connected")
+_pool = None
+
+
+def _get_pool() -> psycopg2.pool.SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        try:
+            _pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=5,
+                dsn=DATABASE_URL,
+                connect_timeout=DB_CONNECT_TIMEOUT,
+            )
+            print("[DB] Connected")
+        except Exception as exc:
+            print(f"[DB] Connection failed after {DB_CONNECT_TIMEOUT}s: {exc}")
+            raise
+    return _pool
+
 
 atexit.register(lambda: _pool.closeall() if _pool and not _pool.closed else None)
 
 
 def get_db_connection():
-    return _pool.getconn()
+    return _get_pool().getconn()
 
 
 def release_db_connection(conn):
@@ -117,12 +139,13 @@ def init_device_control():
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO device_control
-            (id, fan_auto, fan_speed_pct, fan_override_pct, fan_status_pct,
-             door_auto, door_target, door_status,
-             feeder_auto, feeder_target, feeder_status)
-            VALUES (1, TRUE, 0, NULL, 0, TRUE, 'open', 'closed', TRUE, 'open', 'closed')
-            ON CONFLICT (id) DO NOTHING
+            INSERT INTO device_control (
+                fan_auto, fan_speed_pct, fan_override_pct, fan_status_pct,
+                door_auto, door_target, door_status,
+                feeder_auto, feeder_target, feeder_status
+            )
+            SELECT TRUE, 0, NULL, 0, TRUE, 'open', 'closed', TRUE, 'open', 'closed'
+            WHERE NOT EXISTS (SELECT 1 FROM device_control)
         """)
         cursor.close()
         conn.commit()
