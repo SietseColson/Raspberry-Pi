@@ -31,7 +31,7 @@ LOCAL_TZ = pytz.timezone("Europe/Brussels")
 POLL_SECONDS = 5
 
 # Motor timing (seconds)
-DOOR_TIMEOUT_SECONDS = 75
+DOOR_TIMEOUT_SECONDS = 105
 FEEDER_OPEN_SECONDS = 8
 FEEDER_CLOSE_SECONDS = 8
 
@@ -43,15 +43,15 @@ FEEDER_OPEN_OFFSET_MIN = 0      # Open at sunrise
 FEEDER_CLOSE_OFFSET_MIN = 0     # Close at sunset
 
 # Backup times (used if API fails)
-BACKUP_SUNRISE_HOUR = 7
+BACKUP_SUNRISE_HOUR = 6
 BACKUP_SUNRISE_MINUTE = 30
-BACKUP_SUNSET_HOUR = 18
-BACKUP_SUNSET_MINUTE = 0
+BACKUP_SUNSET_HOUR = 20
+BACKUP_SUNSET_MINUTE = 50
 
 # Validation sets
 VALID_DOOR_TARGETS = {"open", "closed"}
 VALID_FEEDER_TARGETS = {"open", "closed"}
-VALID_DOOR_STATUSES = {"open", "closed", "moving", "error"}
+VALID_DOOR_STATUSES = {"open", "closed", "moving", "inbetween", "error"}
 VALID_FEEDER_STATUSES = {"open", "closed", "moving", "error"}
 
 # Cache for sun times (to avoid repeated API calls)
@@ -59,6 +59,8 @@ LAST_VALID_SUN_TIMES = {
     "sunrise": None,
     "sunset": None,
     "fetch_date": None,
+    "last_fetch_time": None,
+    "last_retry": None,
 }
 
 # =============================================================================
@@ -300,13 +302,25 @@ def get_sun_times() -> Tuple[datetime, datetime]:
     """
     Fetch sunrise/sunset times from the API.
     Falls back to cached times or fixed backup times on failure.
-    Only fetches once per day.
+    Retries every hour if API fails, fetches once per day if successful.
     """
     today = datetime.now(LOCAL_TZ).date()
+    now = datetime.now(LOCAL_TZ)
 
-    # Use cached times if we already fetched today
+    # Use cached times if we already fetched successfully today
     if LAST_VALID_SUN_TIMES["fetch_date"] == today:
-        return LAST_VALID_SUN_TIMES["sunrise"], LAST_VALID_SUN_TIMES["sunset"]
+        if LAST_VALID_SUN_TIMES["last_fetch_time"] is not None:
+            # Successful fetch today, use cached times
+            return LAST_VALID_SUN_TIMES["sunrise"], LAST_VALID_SUN_TIMES["sunset"]
+        # Failed fetch today, check if 1 hour has passed to retry
+        last_retry = LAST_VALID_SUN_TIMES.get("last_retry")
+        if last_retry is not None:
+            time_since_last = now - last_retry
+            if time_since_last < timedelta(hours=1):
+                # Less than 1 hour since last retry, use cached/fallback
+                if LAST_VALID_SUN_TIMES["sunrise"] is not None:
+                    return LAST_VALID_SUN_TIMES["sunrise"], LAST_VALID_SUN_TIMES["sunset"]
+        # Time to retry the API
 
     try:
         url = (
@@ -336,12 +350,14 @@ def get_sun_times() -> Tuple[datetime, datetime]:
         LAST_VALID_SUN_TIMES["sunrise"] = sunrise
         LAST_VALID_SUN_TIMES["sunset"] = sunset
         LAST_VALID_SUN_TIMES["fetch_date"] = today
+        LAST_VALID_SUN_TIMES["last_fetch_time"] = now  # Mark as successful fetch
 
         print(f"[SUN] Fetched: rise={sunrise.strftime('%H:%M')} set={sunset.strftime('%H:%M')}")
         return sunrise, sunset
 
     except Exception as exc:
-        print(f"[SUN] API error: {exc}")
+        print(f"[SUN] API error (will retry in 1 hour): {exc}")
+        LAST_VALID_SUN_TIMES["last_retry"] = now  # Mark retry time for hourly retry
 
         # Use cached times if available
         if LAST_VALID_SUN_TIMES["sunrise"] is not None:
@@ -354,28 +370,51 @@ def get_sun_times() -> Tuple[datetime, datetime]:
         LAST_VALID_SUN_TIMES["sunrise"] = backup_rise
         LAST_VALID_SUN_TIMES["sunset"] = backup_set
         LAST_VALID_SUN_TIMES["fetch_date"] = today
+        LAST_VALID_SUN_TIMES["last_fetch_time"] = None  # Mark as failed fetch
         return backup_rise, backup_set
+
+
+def is_door_motor_running() -> bool:
+    """
+    Check if the door motor is currently running.
+    Returns True if either forward or backward pin is active.
+    """
+    try:
+        return door_motor.is_active
+    except Exception:
+        return False
 
 
 def sync_door_status_from_switches() -> Optional[str]:
     """
-    Sync door status in database with physical switch positions.
-    Returns the detected status: 'open', 'closed', 'error', or None.
+    Sync door status in database with physical switch positions and motor state.
+    Returns the detected status: 'open', 'closed', 'moving', 'inbetween', or 'error'.
     """
     top = switch_top.is_pressed
     bottom = switch_bottom.is_pressed
+    motor_running = is_door_motor_running()
 
     if top and bottom:
+        # Both switches pressed: impossible state
         db_utils.update_device_control(door_status="error")
         return "error"
     elif top:
+        # Top switch pressed: door is open
         db_utils.update_device_control(door_status="open")
         return "open"
     elif bottom:
+        # Bottom switch pressed: door is closed
         db_utils.update_device_control(door_status="closed")
         return "closed"
+    elif motor_running:
+        # Neither switch pressed but motor is running: door is moving
+        db_utils.update_device_control(door_status="moving")
+        return "moving"
     else:
-        return None
+        # Neither switch pressed and motor stopped: door is inbetween
+        # This should only happen if a movement was interrupted or partially completed
+        db_utils.update_device_control(door_status="inbetween")
+        return "inbetween"
 
 
 # =============================================================================
@@ -528,8 +567,9 @@ def main_loop() -> None:
 
     while True:
         try:
-            # Sync door switches to database
-            sync_door_status_from_switches()
+            # Sync door switches and motor state to database
+            door_status = sync_door_status_from_switches()
+            print(f"[DOOR] Detected physical state: {door_status}")
 
             # Fetch current state from database
             row = db_utils.fetch_device_control()
