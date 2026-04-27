@@ -77,7 +77,7 @@ feeder_motor = Motor(forward=20, backward=21)
 
 # Fan control on H-bridge A (no reverse)
 """Fan motor on H-bridge A: IN1=23, IN2=24, EN=25."""
-fan_motor = Motor(forward=23, backward=24, enable=25, pwm_frequency=10000)
+fan_motor = Motor(forward=23, backward=24, enable=25)
 
 # Predator alarm (LED)
 predator_led = LED(22)
