@@ -9,6 +9,7 @@ This script is designed to run continuously as a systemctl service.
 """
 
 import atexit
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
@@ -62,6 +63,9 @@ LAST_VALID_SUN_TIMES = {
     "last_fetch_time": None,
     "last_retry": None,
 }
+
+# Threading lock for database operations
+DB_LOCK = threading.Lock()
 
 # =============================================================================
 # GPIO SETUP
@@ -166,11 +170,13 @@ def open_door() -> bool:
 
     if switch_top.is_pressed:
         print("[DOOR] Already open")
-        db_utils.update_device_control(door_status="open")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="open")
         stop_door()
         return True
 
-    db_utils.update_device_control(door_status="moving")
+    with DB_LOCK:
+        db_utils.update_device_control(door_status="moving")
     start = time.monotonic()
     door_motor.forward(1)
 
@@ -179,21 +185,31 @@ def open_door() -> bool:
             if time.monotonic() - start > DOOR_TIMEOUT_SECONDS:
                 print(f"[DOOR] Timeout opening (>{DOOR_TIMEOUT_SECONDS}s)")
                 stop_door()
-                db_utils.update_device_control(door_status="error")
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="error")
                 return False
 
             time.sleep(0.02)
 
         stop_door()
-        db_utils.update_device_control(door_status="open")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="open")
         print("[DOOR] Opened successfully")
         return True
 
     except Exception as exc:
         print(f"[DOOR] Error opening: {exc}")
         stop_door()
-        db_utils.update_device_control(door_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="error")
         return False
+
+
+def open_door_thread() -> None:
+    """Start door opening in a background thread."""
+    thread = threading.Thread(target=open_door, name="door_open")
+    thread.daemon = True
+    thread.start()
 
 
 def close_door() -> bool:
@@ -205,11 +221,13 @@ def close_door() -> bool:
 
     if switch_bottom.is_pressed:
         print("[DOOR] Already closed")
-        db_utils.update_device_control(door_status="closed")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="closed")
         stop_door()
         return True
 
-    db_utils.update_device_control(door_status="moving")
+    with DB_LOCK:
+        db_utils.update_device_control(door_status="moving")
     start = time.monotonic()
     door_motor.backward(1)
 
@@ -218,61 +236,91 @@ def close_door() -> bool:
             if time.monotonic() - start > DOOR_TIMEOUT_SECONDS:
                 print(f"[DOOR] Timeout closing (>{DOOR_TIMEOUT_SECONDS}s)")
                 stop_door()
-                db_utils.update_device_control(door_status="error")
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="error")
                 return False
 
             time.sleep(0.02)
 
         stop_door()
-        db_utils.update_device_control(door_status="closed")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="closed")
         print("[DOOR] Closed successfully")
         return True
 
     except Exception as exc:
         print(f"[DOOR] Error closing: {exc}")
         stop_door()
-        db_utils.update_device_control(door_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="error")
         return False
+
+
+def close_door_thread() -> None:
+    """Start door closing in a background thread."""
+    thread = threading.Thread(target=close_door, name="door_close")
+    thread.daemon = True
+    thread.start()
 
 
 def feeder_open() -> bool:
     """Open the feeder by running motor forward for a fixed duration."""
     print("[FEEDER] Opening...")
 
-    db_utils.update_device_control(feeder_status="moving")
+    with DB_LOCK:
+        db_utils.update_device_control(feeder_status="moving")
     feeder_motor.forward(1)
 
     try:
         time.sleep(FEEDER_OPEN_SECONDS)
         stop_feeder()
-        db_utils.update_device_control(feeder_status="open")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="open")
         print("[FEEDER] Opened successfully")
         return True
     except Exception as exc:
         print(f"[FEEDER] Error opening: {exc}")
         stop_feeder()
-        db_utils.update_device_control(feeder_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="error")
         return False
+
+
+def feeder_open_thread() -> None:
+    """Start feeder opening in a background thread."""
+    thread = threading.Thread(target=feeder_open, name="feeder_open")
+    thread.daemon = True
+    thread.start()
 
 
 def feeder_close() -> bool:
     """Close the feeder by running motor backward for a fixed duration."""
     print("[FEEDER] Closing...")
 
-    db_utils.update_device_control(feeder_status="moving")
+    with DB_LOCK:
+        db_utils.update_device_control(feeder_status="moving")
     feeder_motor.backward(1)
 
     try:
         time.sleep(FEEDER_CLOSE_SECONDS)
         stop_feeder()
-        db_utils.update_device_control(feeder_status="closed")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="closed")
         print("[FEEDER] Closed successfully")
         return True
     except Exception as exc:
         print(f"[FEEDER] Error closing: {exc}")
         stop_feeder()
-        db_utils.update_device_control(feeder_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="error")
         return False
+
+
+def feeder_close_thread() -> None:
+    """Start feeder closing in a background thread."""
+    thread = threading.Thread(target=feeder_close, name="feeder_close")
+    thread.daemon = True
+    thread.start()
 
 
 # =============================================================================
@@ -516,9 +564,9 @@ def apply_door_state(row: dict, door_open_time: datetime, door_close_time: datet
 
     # Move motor to reach desired state
     if desired == "open":
-        open_door()
+        open_door_thread()
     elif desired == "closed":
-        close_door()
+        close_door_thread()
 
 
 def apply_feeder_state(row: dict, feeder_open_time: datetime, feeder_close_time: datetime) -> None:
@@ -543,9 +591,9 @@ def apply_feeder_state(row: dict, feeder_open_time: datetime, feeder_close_time:
 
     # Move motor to reach desired state
     if desired == "open":
-        feeder_open()
+        feeder_open_thread()
     elif desired == "closed":
-        feeder_close()
+        feeder_close_thread()
 
 
 def apply_predator_alarm(is_dark: bool) -> None:
