@@ -31,8 +31,8 @@ LOCAL_TZ = pytz.timezone("Europe/Brussels")
 # Polling interval (seconds)
 POLL_SECONDS = 5
 
-# Motor timing (seconds)
-DOOR_TIMEOUT_SECONDS = 105
+ # Motor timing (seconds)
+DOOR_TIMEOUT_SECONDS = 60
 FEEDER_OPEN_SECONDS = 8
 FEEDER_CLOSE_SECONDS = 8
 
@@ -52,7 +52,7 @@ BACKUP_SUNSET_MINUTE = 50
 # Validation sets
 VALID_DOOR_TARGETS = {"open", "closed"}
 VALID_FEEDER_TARGETS = {"open", "closed"}
-VALID_DOOR_STATUSES = {"open", "closed", "moving", "inbetween", "error"}
+VALID_DOOR_STATUSES = {"open", "closed", "moving", "inbetween", "timeout", "error"}
 VALID_FEEDER_STATUSES = {"open", "closed", "moving", "error"}
 
 # Cache for sun times (to avoid repeated API calls)
@@ -186,7 +186,7 @@ def open_door() -> bool:
                 print(f"[DOOR] Timeout opening (>{DOOR_TIMEOUT_SECONDS}s)")
                 stop_door()
                 with DB_LOCK:
-                    db_utils.update_device_control(door_status="error")
+                    db_utils.update_device_control(door_status="timeout")
                 return False
 
             time.sleep(0.02)
@@ -237,7 +237,7 @@ def close_door() -> bool:
                 print(f"[DOOR] Timeout closing (>{DOOR_TIMEOUT_SECONDS}s)")
                 stop_door()
                 with DB_LOCK:
-                    db_utils.update_device_control(door_status="error")
+                    db_utils.update_device_control(door_status="timeout")
                 return False
 
             time.sleep(0.02)
@@ -459,8 +459,12 @@ def sync_door_status_from_switches() -> Optional[str]:
         db_utils.update_device_control(door_status="moving")
         return "moving"
     else:
-        # Neither switch pressed and motor stopped: door is inbetween
-        # This should only happen if a movement was interrupted or partially completed
+        # Neither switch pressed and motor stopped: door is inbetween.
+        # Preserve a previously detected timeout state until an open/closed event occurs.
+        current = db_utils.fetch_device_control() or {}
+        if current.get("door_status") == "timeout":
+            return "timeout"
+
         db_utils.update_device_control(door_status="inbetween")
         return "inbetween"
 

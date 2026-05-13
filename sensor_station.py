@@ -44,8 +44,8 @@ vtt_state = VTTState(m=0.0, consecutive_unfavourable_minutes=0)
 # ============================================================================
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    """Convert to float, returning *default* for None or non-numeric values."""
+def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
+    """Convert to float, preserving missing or invalid values as None."""
     if value is None:
         return default
     try:
@@ -69,15 +69,15 @@ class WindowAccumulator:
         self.last_timestamp: datetime = datetime.now()
 
     def add(self, sample: Dict) -> None:
-        self.t1.append(_safe_float(sample.get("temperature1_c"), 22.0))
-        self.t2.append(_safe_float(sample.get("temperature2_c"), 22.0))
-        self.h1.append(_safe_float(sample.get("humidity1_pct"), 60.0))
-        self.h2.append(_safe_float(sample.get("humidity2_pct"), 60.0))
-        self.u1.append(_safe_float(sample.get("ultrasonic1_cm"), 50.0))
-        self.u2.append(_safe_float(sample.get("ultrasonic2_cm"), 50.0))
-        self.h2s.append(_safe_float(sample.get("h2s_ppm"), 0.0))
-        self.co2.append(_safe_float(sample.get("co2_ppm"), 400.0))
-        self.nh3.append(_safe_float(sample.get("nh3_ppm"), 0.0))
+        self.t1.append(_safe_float(sample.get("temperature1_c")))
+        self.t2.append(_safe_float(sample.get("temperature2_c")))
+        self.h1.append(_safe_float(sample.get("humidity1_pct")))
+        self.h2.append(_safe_float(sample.get("humidity2_pct")))
+        self.u1.append(_safe_float(sample.get("ultrasonic1_cm")))
+        self.u2.append(_safe_float(sample.get("ultrasonic2_cm")))
+        self.h2s.append(_safe_float(sample.get("h2s_ppm")))
+        self.co2.append(_safe_float(sample.get("co2_ppm")))
+        self.nh3.append(_safe_float(sample.get("nh3_ppm")))
         self.last_timestamp = sample["timestamp"]
         self.errors.update(sample.get("error", []))
 
@@ -129,22 +129,45 @@ def evaluate_levels(result: Dict) -> Dict:
     w = result["waterer_pct"]
 
     result["temperature_status"] = (
-        "critical" if t < -7 or t > 30 else "warning" if t < 4 or t > 27 else "normal"
+        "critical" if t is not None and (t < -7 or t > 30)
+        else "warning" if t is not None and (t < 4 or t > 27)
+        else "normal" if t is not None
+        else "unknown"
     )
     result["humidity_status"] = (
-        "critical" if rh <= 50 or rh >= 85 else "warning" if rh <= 55 or rh >= 80 else "normal"
+        "critical" if rh is not None and (rh <= 50 or rh >= 85)
+        else "warning" if rh is not None and (rh <= 55 or rh >= 80)
+        else "normal" if rh is not None
+        else "unknown"
     )
-    result["h2s_level"] = "critical" if h > 1700 else "warning" if h > 12 else "normal"
+    result["h2s_level"] = (
+        "critical" if h is not None and h > 1700
+        else "warning" if h is not None and h > 12
+        else "normal" if h is not None
+        else None
+    )
 
-    co2 = result.get("co2_ppm", 0)
-    result["co2_level"] = "critical" if co2 > 3000 else "warning" if co2 > 2500 else "normal"
+    co2 = result.get("co2_ppm")
+    result["co2_level"] = (
+        "critical" if co2 is not None and co2 > 3000
+        else "warning" if co2 is not None and co2 > 2500
+        else "normal" if co2 is not None
+        else None
+    )
 
-    nh3 = result.get("nh3_ppm", 0)
-    result["nh3_level"] = "critical" if nh3 > 25 else "warning" if nh3 > 15 else "normal"
+    nh3 = result.get("nh3_ppm")
+    result["nh3_level"] = (
+        "critical" if nh3 is not None and nh3 > 25
+        else "warning" if nh3 is not None and nh3 > 15
+        else "normal" if nh3 is not None
+        else None
+    )
 
-    result["feeder_status"] = feeder_status_label(f)
-    result["waterer_status"] = drinker_status_label(w)
-    result["heat_stress_index"] = heat_stress_status(t, rh)
+    result["feeder_status"] = feeder_status_label(f) if f is not None else "unknown"
+    result["waterer_status"] = drinker_status_label(w) if w is not None else "unknown"
+    result["heat_stress_index"] = (
+        heat_stress_status(t, rh) if t is not None and rh is not None else None
+    )
 
     return result
 
@@ -292,69 +315,49 @@ def open_serial_connection(serial_port_arg: Optional[str]) -> serial.Serial:
 # ============================================================================
 
 
-def correct_sample(sample: Dict, last_good_raw: Dict[str, float], previous_row: Optional[Dict]) -> Dict:
+def correct_sample(sample: Dict) -> Dict:
     s = dict(sample)
 
-    fallback_temp = (previous_row.get("temperature_c") if previous_row else None) or 22.0
-    fallback_hum = (previous_row.get("humidity_pct") if previous_row else None) or 60.0
-    fallback_h2s = (previous_row.get("h2s_ppm") if previous_row else None) or 5.0
-    fallback_co2 = (previous_row.get("co2_ppm") if previous_row else None) or 400.0
-    fallback_nh3 = (previous_row.get("nh3_ppm") if previous_row else None) or 0.0
+    sensor_keys = [
+        ("temperature1_c", "dht1"),
+        ("temperature2_c", "dht2"),
+        ("humidity1_pct", "humidity1"),
+        ("humidity2_pct", "humidity2"),
+        ("h2s_ppm", "h2s"),
+        ("co2_ppm", "co2"),
+        ("nh3_ppm", "nh3"),
+        ("ultrasonic1_cm", "ultrasonic1"),
+        ("ultrasonic2_cm", "ultrasonic2"),
+    ]
 
-    if s.get("temperature1_c") is None:
-        s["temperature1_c"] = s.get("temperature2_c", fallback_temp)
-        s["error"].append("dht1")
-
-    if s.get("temperature2_c") is None:
-        s["temperature2_c"] = s.get("temperature1_c", fallback_temp)
-        s["error"].append("dht2")
-
-    if s.get("humidity1_pct") is None:
-        s["humidity1_pct"] = s.get("humidity2_pct", fallback_hum)
-        s["error"].append("humidity1")
-
-    if s.get("humidity2_pct") is None:
-        s["humidity2_pct"] = s.get("humidity1_pct", fallback_hum)
-        s["error"].append("humidity2")
-
-    if s.get("h2s_ppm") is None:
-        s["h2s_ppm"] = fallback_h2s
-        s["error"].append("h2s")
-
-    if s.get("co2_ppm") is None:
-        s["co2_ppm"] = fallback_co2
-        s["error"].append("co2")
-
-    if s.get("nh3_ppm") is None:
-        s["nh3_ppm"] = fallback_nh3
-        s["error"].append("nh3")
-
-    if s.get("ultrasonic1_cm") is None:
-        s["ultrasonic1_cm"] = last_good_raw.get("ultrasonic1_cm", DEFAULT_ULTRASONIC_CM)
-        s["error"].append("ultrasonic1")
-
-    if s.get("ultrasonic2_cm") is None:
-        s["ultrasonic2_cm"] = last_good_raw.get("ultrasonic2_cm", DEFAULT_ULTRASONIC_CM)
-        s["error"].append("ultrasonic2")
-
-    last_good_raw["ultrasonic1_cm"] = float(s["ultrasonic1_cm"])
-    last_good_raw["ultrasonic2_cm"] = float(s["ultrasonic2_cm"])
+    for key, error_code in sensor_keys:
+        value = _safe_float(s.get(key))
+        if value is None:
+            s[key] = None
+            s["error"].append(error_code)
+        else:
+            s[key] = value
 
     return s
 
 
 def build_window_result(window: WindowAccumulator) -> Dict:
-    avg_t = round((sum(window.t1) + sum(window.t2)) / (2 * len(window.t1)), 2)
-    avg_h = round((sum(window.h1) + sum(window.h2)) / (2 * len(window.h1)), 2)
-    avg_h2s = round(sum(window.h2s) / len(window.h2s), 3)
-    avg_co2 = round(sum(window.co2) / len(window.co2), 1)
-    avg_nh3 = round(sum(window.nh3) / len(window.nh3), 3)
+    def mean_or_none(values: List[Optional[float]]) -> Optional[float]:
+        valid = [v for v in values if v is not None]
+        if not valid:
+            return None
+        return round(sum(valid) / len(valid), 2)
 
-    avg_u1_cm = sum(window.u1) / len(window.u1)
-    avg_u2_cm = sum(window.u2) / len(window.u2)
+    avg_t = mean_or_none(window.t1)
+    avg_h = mean_or_none(window.h1 + window.h2)
+    avg_h2s = mean_or_none(window.h2s)
+    avg_co2 = mean_or_none(window.co2)
+    avg_nh3 = mean_or_none(window.nh3)
+    avg_u1_cm = mean_or_none(window.u1)
+    avg_u2_cm = mean_or_none(window.u2)
 
-    feeder_pct = round(feeder_status(avg_u1_cm / 100.0), 2)
-    waterer_pct = round(drinker_status(avg_u2_cm / 100.0), 2)
+    feeder_pct = round(feeder_status(avg_u1_cm / 100.0), 2) if avg_u1_cm is not None else None
+    waterer_pct = round(drinker_status(avg_u2_cm / 100.0), 2) if avg_u2_cm is not None else None
 
     result = {
         "temperature_c": avg_t,
@@ -370,13 +373,17 @@ def build_window_result(window: WindowAccumulator) -> Dict:
     }
 
     result = evaluate_levels(result)
-    step = vtt_original_step(
-        temp_c=result["temperature_c"],
-        rh=result["humidity_pct"],
-        state=vtt_state,
-        params=VTT_PARAMS,
-    )
-    result["mold_risk_score"], result["mold_risk_status"] = mold_risk_from_m(step.m)
+    if result["temperature_c"] is None or result["humidity_pct"] is None:
+        result["mold_risk_score"] = None
+        result["mold_risk_status"] = None
+    else:
+        step = vtt_original_step(
+            temp_c=result["temperature_c"],
+            rh=result["humidity_pct"],
+            state=vtt_state,
+            params=VTT_PARAMS,
+        )
+        result["mold_risk_score"], result["mold_risk_status"] = mold_risk_from_m(step.m)
 
     return result
 
@@ -402,9 +409,8 @@ def run_self_test() -> None:
     }
 
     window = WindowAccumulator()
-    last_good_raw: Dict[str, float] = {}
     for _ in range(10):
-        fixed = correct_sample(sample, last_good_raw, None)
+        fixed = correct_sample(sample)
         window.add(fixed)
 
     result = build_window_result(window)
@@ -443,14 +449,13 @@ def main(serial_port_arg: Optional[str]) -> None:
     last_data_time = time.monotonic()
     window = WindowAccumulator()
     next_flush_at = time.monotonic() + REPORT_EVERY_SECONDS
-    last_good_raw: Dict[str, float] = {}
 
     while True:
         try:
             data = read_serial_line(ser)
             if data:
                 last_data_time = time.monotonic()
-                corrected = correct_sample(data, last_good_raw, previous_row)
+                corrected = correct_sample(data)
                 window.add(corrected)
                 print(f"[WINDOW] Added sample ({len(window.t1)} readings so far)")
 
