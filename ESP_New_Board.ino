@@ -1,6 +1,7 @@
 #include <DHT.h>
 #include <ArduinoJson.h>
-#include <ESPSoftwareSerial.h>
+#include <SoftwareSerial.h>
+#include <math.h>
 
 /************ PIN CONFIG ************/
 #define DHTTYPE DHT22
@@ -31,7 +32,7 @@
 
 HardwareSerial ultrasonic1(1);
 HardwareSerial ultrasonic2(2);
-ESPSoftwareSerial swSerialCO2(MHZ19C_RX, MHZ19C_TX);
+SoftwareSerial swSerialCO2;
 
 /************ OBJECTS ************/
 DHT dht1(DHT1_PIN, DHTTYPE);
@@ -56,7 +57,8 @@ const uint32_t DHT_INTERVAL_MS = 2500;
 const uint32_t MQ136_SAMPLE_INTERVAL_MS = 500;
 const uint32_t MQ136_WARMUP_MS = 120000;
 const uint32_t ULTRASONIC_STALE_MS = 1500;
-const uint32_t MHZ19C_STALE_MS = 3000;
+const uint32_t MHZ19C_STALE_MS = 10000;
+static uint32_t nextCo2ReadMs = 0;
 const float H2S_MAX_PPM = 500.0;
 const float NH3_MAX_PPM = 200.0;
 const int CO2_MAX_PPM = 5500;
@@ -65,10 +67,9 @@ const uint32_t MQ137_WARMUP_MS = 120000;
 const uint32_t SWITCH_DEBOUNCE_MS = 20;
 const uint32_t DOOR_TIMEOUT_MS = 60000;
 const uint32_t FEEDER_RUN_MS = 8000;
-const int FAN_PWM_CHANNEL = 0;
 const int FAN_PWM_FREQ = 5000;
 const int FAN_PWM_RESOLUTION = 8;
-const uint32_t SWITCH_DEBOUNCE_MS = 20;
+
 
 /************ MQ136 CALIBRATION STATE ************/
 static bool calibrated = false;
@@ -108,7 +109,8 @@ static bool bottom_switch_state = HIGH;
 static bool top_switch_state = HIGH;
 static uint32_t bottom_switch_last_debounce_ms = 0;
 static uint32_t top_switch_last_debounce_ms = 0;
-static String serialCommandBuffer = "";
+char serialCommandBuffer[257] = {0};
+uint16_t serialCommandIndex = 0;
 enum DoorCommandState { DOOR_IDLE, DOOR_OPENING, DOOR_CLOSING };
 static DoorCommandState doorCommandState = DOOR_IDLE;
 static uint32_t doorCommandStartMs = 0;
@@ -334,12 +336,12 @@ void setFanPct(int pct) {
   if (pct == 0) {
     digitalWrite(FAN_IN1_PIN, LOW);
     digitalWrite(FAN_IN2_PIN, LOW);
-    ledcWrite(FAN_PWM_CHANNEL, 0);
+    ledcWrite(FAN_EN_PIN, 0);
   } else {
     digitalWrite(FAN_IN1_PIN, HIGH);
     digitalWrite(FAN_IN2_PIN, LOW);
     int duty = map(pct, 0, 100, 0, 255);
-    ledcWrite(FAN_PWM_CHANNEL, duty);
+    ledcWrite(FAN_EN_PIN, duty);
   }
 }
 
@@ -410,12 +412,10 @@ void updateSwitchState(uint8_t pin, bool &stableState, uint32_t &lastDebounceMs,
         }
       }
     }
-  } else {
-    lastDebounceMs = nowMs;
   }
 }
 
-void parseSerialCommand(const String &line) {
+void parseSerialCommand(const char *line) {
   StaticJsonDocument<256> cmd;
   DeserializationError err = deserializeJson(cmd, line);
   if (err) {
@@ -478,15 +478,16 @@ void handleSerialCommands() {
       continue;
     }
     if (c == '\n') {
-      if (serialCommandBuffer.length() > 0) {
+      if (serialCommandIndex > 0) {
+        serialCommandBuffer[serialCommandIndex] = '\0';
         parseSerialCommand(serialCommandBuffer);
-        serialCommandBuffer = "";
+        serialCommandIndex = 0;
+        serialCommandBuffer[0] = '\0';
       }
       continue;
     }
-    serialCommandBuffer += c;
-    if (serialCommandBuffer.length() > 256) {
-      serialCommandBuffer = serialCommandBuffer.substring(serialCommandBuffer.length() - 256);
+    if (serialCommandIndex < sizeof(serialCommandBuffer) - 1) {
+      serialCommandBuffer[serialCommandIndex++] = c;
     }
   }
 }
@@ -494,7 +495,7 @@ void handleSerialCommands() {
 
 void emitJsonReport(uint32_t nowMs) {
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   doc["type"] = "telemetry";
   doc["timestamp_ms"] = nowMs;
 
@@ -558,46 +559,8 @@ void emitJsonReport(uint32_t nowMs) {
     doc["door_state"] = "moving_or_unknown";
   }
 
-  if (bottom_switch_state == LOW) {
-    doc["door_state"] = "fully_closed";
-  } else if (top_switch_state == LOW) {
-    doc["door_state"] = "fully_open";
-  } else {
-    doc["door_state"] = "moving_or_unknown";
-  }
-
   serializeJson(doc, Serial);
   Serial.println();
-}
-
-void publishSwitchEvent(const char *device, const char *status) {
-  StaticJsonDocument<128> evt;
-  evt["type"] = "event";
-  evt["device"] = device;
-  evt["status"] = status;
-  serializeJson(evt, Serial);
-  Serial.println();
-}
-
-void updateSwitchState(uint8_t pin, bool &stableState, uint32_t &lastDebounceMs, const char *device, bool isTopSwitch) {
-  bool rawState = digitalRead(pin);
-  uint32_t nowMs = millis();
-
-  if (rawState != stableState) {
-    if ((int32_t)(nowMs - lastDebounceMs) >= 0) {
-      if (nowMs - lastDebounceMs >= SWITCH_DEBOUNCE_MS) {
-        stableState = rawState;
-        lastDebounceMs = nowMs;
-        if (stableState == LOW) {
-          publishSwitchEvent(device, isTopSwitch ? "OPEN" : "CLOSED");
-        } else {
-          publishSwitchEvent(device, "RELEASED");
-        }
-      }
-    }
-  } else {
-    lastDebounceMs = nowMs;
-  }
 }
 
 
@@ -611,130 +574,142 @@ int readCO2() {
 
   byte response[9];
 
-  swSerialCO2.listen();
   while (swSerialCO2.available()) {
     swSerialCO2.read();
-  }
-  swSerialCO2.write(command, 9);
+    }
+    swSerialCO2.write(command, 9);
 
-  delay(100);   // allow MH-Z19C enough time to respond
+    delay(100);   // allow MH-Z19C enough time to respond
 
-  if (swSerialCO2.available() < 9) {
-    return -1;
-  }
+    if (swSerialCO2.available() < 9) {
+        return -1;
+    }
 
-  for (int i = 0; i < 9; i++) {
-    response[i] = swSerialCO2.read();
-  }
+    for (int i = 0; i < 9; i++) {
+        response[i] = swSerialCO2.read();
+    }
 
-  if (response[0] != 0xFF || response[1] != 0x86) {
-    return -1;
-  }
-
-  return (response[2] << 8) + response[3];
+    if (response[0] != 0xFF || response[1] != 0x86) {
+        return -1;
+    }
+    uint8_t checksum = 0;
+    for (int i = 1; i < 8; i++) {
+        checksum += response[i];
+    }
+    checksum = 0xFF - checksum + 1;
+    if (checksum != response[8]) {
+        return -1;
+    }
+    return (response[2] << 8) + response[3];
 }
 
 
 /************ SETUP ************/
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
 
-  pinMode(uSWITCH1_PIN, INPUT_PULLUP);
-  pinMode(uSWITCH2_PIN, INPUT_PULLUP);
+    pinMode(uSWITCH1_PIN, INPUT_PULLUP);
+    pinMode(uSWITCH2_PIN, INPUT_PULLUP);
 
-  pinMode(M1_IN1_PIN, OUTPUT);
-  pinMode(M1_IN2_PIN, OUTPUT);
-  pinMode(M2_IN1_PIN, OUTPUT);
-  pinMode(M2_IN2_PIN, OUTPUT);
-  pinMode(FAN_IN1_PIN, OUTPUT);
-  pinMode(FAN_IN2_PIN, OUTPUT);
-  pinMode(FAN_EN_PIN, OUTPUT);
-  digitalWrite(M1_IN1_PIN, LOW);
-  digitalWrite(M1_IN2_PIN, LOW);
-  digitalWrite(M2_IN1_PIN, LOW);
-  digitalWrite(M2_IN2_PIN, LOW);
-  digitalWrite(FAN_IN1_PIN, LOW);
-  digitalWrite(FAN_IN2_PIN, LOW);
-  ledcSetup(FAN_PWM_CHANNEL, FAN_PWM_FREQ, FAN_PWM_RESOLUTION);
-  ledcAttachPin(FAN_EN_PIN, FAN_PWM_CHANNEL);
-  ledcWrite(FAN_PWM_CHANNEL, 0);
+    pinMode(M1_IN1_PIN, OUTPUT);
+    pinMode(M1_IN2_PIN, OUTPUT);
+    pinMode(M2_IN1_PIN, OUTPUT);
+    pinMode(M2_IN2_PIN, OUTPUT);
+    pinMode(FAN_IN1_PIN, OUTPUT);
+    pinMode(FAN_IN2_PIN, OUTPUT);
+    pinMode(FAN_EN_PIN, OUTPUT);
+    digitalWrite(M1_IN1_PIN, LOW);
+    digitalWrite(M1_IN2_PIN, LOW);
+    digitalWrite(M2_IN1_PIN, LOW);
+    digitalWrite(M2_IN2_PIN, LOW);
+    digitalWrite(FAN_IN1_PIN, LOW);
+    digitalWrite(FAN_IN2_PIN, LOW);
+    ledcAttach(FAN_EN_PIN, FAN_PWM_FREQ, FAN_PWM_RESOLUTION);
+    ledcWrite(FAN_EN_PIN, 0);
 
-  bottom_switch_state = digitalRead(uSWITCH1_PIN);
-  top_switch_state = digitalRead(uSWITCH2_PIN);
-  bottom_switch_last_debounce_ms = millis();
-  top_switch_last_debounce_ms = millis();
+    bottom_switch_state = digitalRead(uSWITCH1_PIN);
+    top_switch_state = digitalRead(uSWITCH2_PIN);
+    bottom_switch_last_debounce_ms = millis();
+    top_switch_last_debounce_ms = millis();
 
-  pinMode(MQ136_PIN, INPUT);
-  pinMode(MQ137_PIN, INPUT);
+    pinMode(MQ136_PIN, INPUT);
+    pinMode(MQ137_PIN, INPUT);
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(MQ136_PIN, ADC_11db);
-  analogSetPinAttenuation(MQ137_PIN, ADC_11db);
+    analogReadResolution(12);
+    analogSetPinAttenuation(MQ136_PIN, ADC_11db);
+    analogSetPinAttenuation(MQ137_PIN, ADC_11db);
 
-  dht1.begin();
-  dht2.begin();
+    dht1.begin();
+    dht2.begin();
 
-  ultrasonic1.begin(9600, SERIAL_8N1, AO2YYUW1_RX, AO2YYUW1_TX);
-  ultrasonic2.begin(9600, SERIAL_8N1, AO2YYUW2_RX, AO2YYUW2_TX);
-  swSerialCO2.begin(9600, SWSERIAL_8N1, MHZ19C_RX, MHZ19C_TX);
+    ultrasonic1.begin(9600, SERIAL_8N1, AO2YYUW1_RX, AO2YYUW1_TX);
+    ultrasonic2.begin(9600, SERIAL_8N1, AO2YYUW2_RX, AO2YYUW2_TX);
+    swSerialCO2.begin(9600, SWSERIAL_8N1, MHZ19C_RX, MHZ19C_TX);
 
-  // Let sensors stabilize before first read
-  delay(500);
+    // Let sensors stabilize before first read
+    delay(500);
 
-  uint32_t nowMs = millis();
-  mq136WarmupStartMs = nowMs;
-  mq137WarmupStartMs = nowMs;
-  nextReportMs = nowMs + REPORT_INTERVAL_MS;
-  nextDhtReadMs = nowMs;
-  nextMq136SampleMs = nowMs;
-  nextMq137SampleMs = nowMs;
+    uint32_t nowMs = millis();
+    mq136WarmupStartMs = nowMs;
+    mq137WarmupStartMs = nowMs;
+    nextReportMs = nowMs + REPORT_INTERVAL_MS;
+    nextDhtReadMs = nowMs;
+    nextMq136SampleMs = nowMs;
+    nextMq137SampleMs = nowMs;
+    nextCo2ReadMs = nowMs;
 }
 
 /************ LOOP ************/
 
 void loop() {
-  uint32_t now_ms = millis();
+    uint32_t now_ms = millis();
 
-  updateA02Stream(ultrasonic1, ultrasonicState1, now_ms);
-  updateA02Stream(ultrasonic2, ultrasonicState2, now_ms);
+    updateA02Stream(ultrasonic1, ultrasonicState1, now_ms);
+    updateA02Stream(ultrasonic2, ultrasonicState2, now_ms);
 
-  if ((int32_t)(now_ms - nextDhtReadMs) >= 0) {
-    updateDhtReadings();
-    nextDhtReadMs += DHT_INTERVAL_MS;
-  }
+    if ((int32_t)(now_ms - nextDhtReadMs) >= 0) {
+        updateDhtReadings();
+        nextDhtReadMs += DHT_INTERVAL_MS;
+    }
 
-  if ((int32_t)(now_ms - nextMq136SampleMs) >= 0) {
-    updateMq136Reading();
-    nextMq136SampleMs += MQ136_SAMPLE_INTERVAL_MS;
-  }
+    if ((int32_t)(now_ms - nextMq136SampleMs) >= 0) {
+        updateMq136Reading();
+        nextMq136SampleMs += MQ136_SAMPLE_INTERVAL_MS;
+    }
 
-  if ((int32_t)(now_ms - nextMq137SampleMs) >= 0) {
-    updateMq137Reading();
-    nextMq137SampleMs += MQ137_SAMPLE_INTERVAL_MS;
-  }
+    if ((int32_t)(now_ms - nextMq137SampleMs) >= 0) {
+        updateMq137Reading();
+        nextMq137SampleMs += MQ137_SAMPLE_INTERVAL_MS;
+    }
 
-  handleSerialCommands();
-  handleDoorCommandState(now_ms);
-  handleFeederCommandState(now_ms);
-  updateSwitchState(uSWITCH1_PIN, bottom_switch_state, bottom_switch_last_debounce_ms, "bottom_switch", false);
-  updateSwitchState(uSWITCH2_PIN, top_switch_state, top_switch_last_debounce_ms, "top_switch", true);
+    handleSerialCommands();
+    handleDoorCommandState(now_ms);
+    handleFeederCommandState(now_ms);
+    updateSwitchState(uSWITCH1_PIN, bottom_switch_state, bottom_switch_last_debounce_ms, "bottom_switch", false);
+    updateSwitchState(uSWITCH2_PIN, top_switch_state, top_switch_last_debounce_ms, "top_switch", true);
 
-  updateSwitchState(uSWITCH1_PIN, bottom_switch_state, bottom_switch_last_debounce_ms, "bottom_switch", false);
-  updateSwitchState(uSWITCH2_PIN, top_switch_state, top_switch_last_debounce_ms, "top_switch", true);
+    if ((int32_t)(now_ms - nextCo2ReadMs) >= 0) {
+        int co2Reading = readCO2();
 
-  int co2Reading = readCO2();
-  if (co2Reading >= 0 && co2Reading <= CO2_MAX_PPM) {
-    co2_ppm = co2Reading;
-    co2_valid = true;
-    co2LastUpdateMs = now_ms;
-  } else {
-    co2_ppm = NAN;
-    co2_valid = false;
-  }
+        if (co2Reading >= 0 && co2Reading <= CO2_MAX_PPM) {
+            co2_ppm = co2Reading;
+            co2_valid = true;
+            co2LastUpdateMs = now_ms;
+        } else {
+            co2_ppm = NAN;
+            co2_valid = false;
+        }
+        nextCo2ReadMs += 3000;
+    }
 
-  if ((int32_t)(now_ms - nextReportMs) >= 0) {
-    emitJsonReport(now_ms);
-    nextReportMs += REPORT_INTERVAL_MS;
-  }
+    if (co2_valid && (now_ms - co2LastUpdateMs > MHZ19C_STALE_MS)) {
+        co2_valid = false;
+        co2_ppm = NAN;
+    }
+
+    if ((int32_t)(now_ms - nextReportMs) >= 0) {
+        emitJsonReport(now_ms);
+        nextReportMs += REPORT_INTERVAL_MS;
+    }
 }
