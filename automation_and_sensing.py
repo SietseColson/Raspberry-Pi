@@ -42,8 +42,8 @@ SERIAL_SILENCE_RECONNECT_SECONDS = 20
 # Fill level constants (ultrasonic distances in cm)
 FEEDER_EMPTY_CM = 28.0
 FEEDER_FULL_CM = 5.0
-WATERER_EMPTY_CM = 22.0
-WATERER_FULL_CM = 4.0
+WATERER_EMPTY_CM = 16.0
+WATERER_FULL_CM = 1.0
 
 # Sunrise/sunset scheduling
 LATITUDE = 50.88
@@ -51,7 +51,7 @@ LONGITUDE = 4.70
 LOCAL_TZ = pytz.timezone("Europe/Brussels")
 
 # Polling interval (seconds)
-POLL_SECONDS = 2
+POLL_SECONDS = 5
 
 # Schedule offsets (minutes relative to sunrise/sunset)
 DOOR_OPEN_OFFSET_MIN = -10      # Open 10 min before sunrise
@@ -235,18 +235,24 @@ def parse_esp_line(line: str) -> Optional[Dict]:
         if not isinstance(payload.get("error"), list):
             payload["error"] = []
 
-        # Sync door state from telemetry
+        # Sync door state from telemetry. Only hit the DB when the state
+        # actually changes — otherwise every 1 Hz telemetry tick would issue
+        # a Supabase write from the reader thread and starve serial reads.
         door_state = payload.get("door_state")
         if door_state == "fully_closed":
+            state_changed = esp_door_state != "fully_closed"
             esp_door_state = "fully_closed"
-            with DB_LOCK:
-                db_utils.update_device_control(door_status="closed")
             esp_command_pending = False
+            if state_changed:
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="closed")
         elif door_state == "fully_open":
+            state_changed = esp_door_state != "fully_open"
             esp_door_state = "fully_open"
-            with DB_LOCK:
-                db_utils.update_device_control(door_status="open")
             esp_command_pending = False
+            if state_changed:
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="open")
         elif door_state == "moving_or_unknown":
             esp_door_state = "moving_or_unknown"
 
