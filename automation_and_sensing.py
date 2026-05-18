@@ -15,6 +15,7 @@ Single process, exclusive serial port ownership, auto-reconnect on failure.
 """
 
 import json
+import queue
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -96,6 +97,11 @@ LAST_VALID_SUN_TIMES = {
 # Threading locks for database and serial access
 DB_LOCK = threading.Lock()
 SERIAL_LOCK = threading.RLock()
+
+# Queue for telemetry handed off from the serial reader thread to the main loop.
+# Decouples serial draining from automation/DB work so a slow DB call cannot
+# starve the serial buffer.
+TELEMETRY_QUEUE: "queue.Queue[Dict]" = queue.Queue()
 
 # Global state
 esp_port: Optional[serial.Serial] = None
@@ -255,14 +261,19 @@ def parse_esp_line(line: str) -> Optional[Dict]:
     return None
 
 
-def read_esp_serial() -> Optional[Dict]:
-    """Read one line from ESP serial, return sensor data or None."""
+def drain_esp_serial() -> List[Dict]:
+    """Drain the ESP serial buffer in one pass, returning all telemetry dicts.
+
+    Switch events are processed inside parse_esp_line for their side effects
+    (door state, esp_command_pending) and are not returned here.
+    """
     global last_data_time
+    results: List[Dict] = []
     with SERIAL_LOCK:
         if esp_port is None or not esp_port.is_open:
             open_esp_serial()
         if esp_port is None or not esp_port.is_open:
-            return None
+            return results
 
         try:
             while esp_port.in_waiting:
@@ -271,12 +282,27 @@ def read_esp_serial() -> Optional[Dict]:
                     data = parse_esp_line(line)
                     if data:
                         last_data_time = time.monotonic()
-                        return data
+                        results.append(data)
         except Exception as exc:
             print(f"[SERIAL] Read error: {exc}")
             close_esp_serial()
 
-        return None
+    return results
+
+
+def serial_reader_loop() -> None:
+    """Daemon thread that continuously drains the ESP serial buffer.
+
+    Telemetry is pushed onto TELEMETRY_QUEUE so the main loop can stay
+    responsive even when DB/network calls in the automation block stall.
+    """
+    while True:
+        try:
+            for data in drain_esp_serial():
+                TELEMETRY_QUEUE.put(data)
+        except Exception as exc:
+            print(f"[SERIAL] Reader thread error: {exc}")
+        time.sleep(0.05)
 
 
 def check_serial_silence() -> bool:
@@ -918,20 +944,19 @@ def cleanup():
 
 
 def main_loop() -> None:
-    """
-    Main unified loop: integrates sensor aggregation and automation control.
-    
-    Each iteration:
-    1. Reads one ESP telemetry line (sensor data)
-    2. Adds to 5-minute rolling window
-    3. Checks for serial reconnect if needed
-    4. Every 5 minutes: aggregates window, uploads to DB
-    5. Every 2 seconds: runs automation logic (door, feeder, fan)
-    """
+    """Main unified loop. Serial reads happen in a daemon thread that feeds
+    TELEMETRY_QUEUE; this loop drains the queue, runs the 5-minute aggregation,
+    and runs automation logic every POLL_SECONDS."""
     print("[MAIN] Starting unified automation and sensing service...")
 
     db_utils.setup_database()
     open_esp_serial()
+
+    threading.Thread(
+        target=serial_reader_loop,
+        daemon=True,
+        name="serial_reader",
+    ).start()
 
     window = WindowAccumulator()
     next_flush_at = time.monotonic() + REPORT_EVERY_SECONDS
@@ -939,9 +964,12 @@ def main_loop() -> None:
 
     while True:
         try:
-            # ===== SENSOR INGESTION =====
-            data = read_esp_serial()
-            if data:
+            # ===== SENSOR INGESTION (drain queue produced by reader thread) =====
+            while True:
+                try:
+                    data = TELEMETRY_QUEUE.get_nowait()
+                except queue.Empty:
+                    break
                 corrected = correct_sample(data)
                 window.add(corrected)
                 print(f"[WINDOW] Added sample ({len(window.t1)} readings so far)")
