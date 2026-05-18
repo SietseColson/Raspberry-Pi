@@ -8,14 +8,11 @@ table in the database. Scheduling is based on sunrise/sunset times.
 This script is designed to run continuously as a systemctl service.
 """
 
-import atexit
 import json
-import os
-import threading
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
-
+import threading
 import pytz
 import requests
 import serial
@@ -31,12 +28,7 @@ LONGITUDE = 4.70
 LOCAL_TZ = pytz.timezone("Europe/Brussels")
 
 # Polling interval (seconds)
-POLL_SECONDS = 5
-
- # Motor timing (seconds)
-DOOR_TIMEOUT_SECONDS = 100
-FEEDER_OPEN_SECONDS = 14
-FEEDER_CLOSE_SECONDS = 14
+POLL_SECONDS = 2
 
 # Schedule offsets (minutes relative to sunrise/sunset)
 DOOR_OPEN_OFFSET_MIN = -10      # Open 10 min before sunrise
@@ -66,8 +58,11 @@ LAST_VALID_SUN_TIMES = {
     "last_retry": None,
 }
 
-# Threading lock for database operations
+# Threading lock for database operations and serial communication to ensure thread safety
 DB_LOCK = threading.Lock()
+SERIAL_LOCK = threading.Lock()
+
+last_fan_pct = None
 
 # =============================================================================
 # GPIO SETUP
@@ -81,12 +76,14 @@ ESP_SERIAL_RECONNECT_SECONDS = 5
 esp_port: Optional[serial.Serial] = None
 esp_door_state = "moving_or_unknown"
 esp_command_pending = False
-esp_command_lock = threading.Lock()
-esp_last_serial_line = ""
 esp_last_telemetry: dict = {}
 
 def open_esp_serial() -> None:
     global esp_port
+    global last_fan_pct
+    
+    last_fan_pct = None
+
     if esp_port is not None and esp_port.is_open:
         return
     try:
@@ -113,20 +110,21 @@ def close_esp_serial() -> None:
 
 
 def send_esp_command(command: dict) -> bool:
-    if esp_port is None or not esp_port.is_open:
-        open_esp_serial()
-    if esp_port is None or not esp_port.is_open:
-        return False
+    with SERIAL_LOCK:
+        if esp_port is None or not esp_port.is_open:
+            open_esp_serial()
+        if esp_port is None or not esp_port.is_open:
+            return False
 
-    payload = json.dumps(command)
-    try:
-        esp_port.write((payload + "\n").encode("utf-8"))
-        esp_port.flush()
-        return True
-    except Exception as exc:
-        print(f"[SERIAL] Failed to send command: {exc}")
-        close_esp_serial()
-        return False
+        payload = json.dumps(command)
+        try:
+            esp_port.write((payload + "\n").encode("utf-8"))
+            esp_port.flush()
+            return True
+        except Exception as exc:
+            print(f"[SERIAL] Failed to send command: {exc}")
+            close_esp_serial()
+            return False
 
 
 def parse_esp_line(line: str) -> None:
@@ -145,14 +143,16 @@ def parse_esp_line(line: str) -> None:
         if device == "bottom_switch":
             if status == "CLOSED":
                 esp_door_state = "fully_closed"
-                db_utils.update_device_control(door_status="closed")
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="closed")
                 esp_command_pending = False
             elif status == "RELEASED":
                 esp_door_state = "moving_or_unknown"
         elif device == "top_switch":
             if status == "OPEN":
                 esp_door_state = "fully_open"
-                db_utils.update_device_control(door_status="open")
+                with DB_LOCK:
+                    db_utils.update_device_control(door_status="open")
                 esp_command_pending = False
             elif status == "RELEASED":
                 esp_door_state = "moving_or_unknown"
@@ -161,11 +161,13 @@ def parse_esp_line(line: str) -> None:
         door_state = payload.get("door_state")
         if door_state == "fully_closed":
             esp_door_state = "fully_closed"
-            db_utils.update_device_control(door_status="closed")
+            with DB_LOCK:
+                    db_utils.update_device_control(door_status="closed")
             esp_command_pending = False
         elif door_state == "fully_open":
             esp_door_state = "fully_open"
-            db_utils.update_device_control(door_status="open")
+            with DB_LOCK:
+                db_utils.update_device_control(door_status="open")
             esp_command_pending = False
         elif door_state == "moving_or_unknown":
             esp_door_state = "moving_or_unknown"
@@ -204,35 +206,39 @@ def cleanup():
     close_esp_serial()
 
 
-def stop_door() -> None:
-    """Stop the door motor via ESP."""
-    send_esp_command({"type": "command", "device": "door", "action": "stop"})
-
-
-def stop_feeder() -> None:
-    """Stop the feeder motor via ESP."""
-    send_esp_command({"type": "command", "device": "feeder", "action": "stop"})
-
-
 def fan_off() -> None:
     """Turn the fan off via ESP."""
     send_esp_command({"type": "command", "device": "fan", "speed_pct": 0})
 
 
 def set_fan_pct(pct: float) -> None:
-    """Set fan speed percentage (0-100) on the ESP32."""
+    global last_fan_pct
+
     try:
-        pct = max(0.0, min(100.0, float(pct)))
+        pct = round(max(0.0, min(100.0, float(pct))), 1)
     except (ValueError, TypeError):
         pct = 0.0
 
+    if pct == last_fan_pct:
+        return
+
+    last_fan_pct = pct
+
     if pct <= 0:
-        print(f"[FAN] OFF (requested {pct:.1f}%)")
+        print(f"[FAN] OFF")
     else:
         print(f"[FAN] Set fan speed to {pct:.1f}%")
 
-    send_esp_command({"type": "command", "device": "fan", "speed_pct": pct})
-    db_utils.update_device_control(fan_status_pct=pct)
+    send_esp_command({
+        "type": "command",
+        "device": "fan",
+        "speed_pct": pct
+    })
+
+    with DB_LOCK:
+        db_utils.update_device_control(
+            fan_status_pct=pct
+        )
 
 
 def open_door() -> bool:
@@ -246,10 +252,11 @@ def open_door() -> bool:
 
 
 def open_door_thread() -> None:
-    """Send the ESP door open command in a background thread."""
-    thread = threading.Thread(target=open_door, name="door_open")
-    thread.daemon = True
-    thread.start()
+    threading.Thread(
+        target=open_door,
+        daemon=True,
+        name="door_open"
+    ).start()
 
 
 def close_door() -> bool:
@@ -263,10 +270,16 @@ def close_door() -> bool:
 
 
 def close_door_thread() -> None:
-    """Send the ESP door close command in a background thread."""
-    thread = threading.Thread(target=close_door, name="door_close")
-    thread.daemon = True
-    thread.start()
+    threading.Thread(
+        target=close_door,
+        daemon=True,
+        name="door_close"
+    ).start()
+
+
+def stop_door() -> None:
+    """Stop the door motor via ESP."""
+    send_esp_command({"type": "command", "device": "door", "action": "stop"})
 
 
 def feeder_open() -> bool:
@@ -278,10 +291,11 @@ def feeder_open() -> bool:
 
 
 def feeder_open_thread() -> None:
-    """Send the ESP feeder open command in a background thread."""
-    thread = threading.Thread(target=feeder_open, name="feeder_open")
-    thread.daemon = True
-    thread.start()
+    threading.Thread(
+        target=feeder_open,
+        daemon=True,
+        name="feeder_open"
+    ).start()
 
 
 def feeder_close() -> bool:
@@ -293,72 +307,16 @@ def feeder_close() -> bool:
 
 
 def feeder_close_thread() -> None:
-    """Send the ESP feeder close command in a background thread."""
-    thread = threading.Thread(target=feeder_close, name="feeder_close")
-    thread.daemon = True
-    thread.start()
-
-# =============================================================================
-# SUN TIMES & SCHEDULING
-# =============================================================================
-def open_door() -> bool:
-    """Send the ESP command to open the door."""
-    print("[DOOR] Sending open command")
-    with DB_LOCK:
-        db_utils.update_device_control(door_status="moving")
-    return send_esp_command({"type": "command", "device": "door", "action": "open"})
+    threading.Thread(
+        target=feeder_close,
+        daemon=True,
+        name="feeder_close"
+    ).start()
 
 
-def open_door_thread() -> None:
-    """Send the ESP door open command in a background thread."""
-    thread = threading.Thread(target=open_door, name="door_open")
-    thread.daemon = True
-    thread.start()
-
-
-def close_door() -> bool:
-    """Send the ESP command to close the door."""
-    print("[DOOR] Sending close command")
-    with DB_LOCK:
-        db_utils.update_device_control(door_status="moving")
-    return send_esp_command({"type": "command", "device": "door", "action": "close"})
-
-
-def close_door_thread() -> None:
-    """Send the ESP door close command in a background thread."""
-    thread = threading.Thread(target=close_door, name="door_close")
-    thread.daemon = True
-    thread.start()
-
-
-def feeder_open() -> bool:
-    """Send the ESP command to open the feeder."""
-    print("[FEEDER] Sending open command")
-    with DB_LOCK:
-        db_utils.update_device_control(feeder_status="moving")
-    return send_esp_command({"type": "command", "device": "feeder", "action": "open"})
-
-
-def feeder_open_thread() -> None:
-    """Send the ESP feeder open command in a background thread."""
-    thread = threading.Thread(target=feeder_open, name="feeder_open")
-    thread.daemon = True
-    thread.start()
-
-
-def feeder_close() -> bool:
-    """Send the ESP command to close the feeder."""
-    print("[FEEDER] Sending close command")
-    with DB_LOCK:
-        db_utils.update_device_control(feeder_status="moving")
-    return send_esp_command({"type": "command", "device": "feeder", "action": "close"})
-
-
-def feeder_close_thread() -> None:
-    """Send the ESP feeder close command in a background thread."""
-    thread = threading.Thread(target=feeder_close, name="feeder_close")
-    thread.daemon = True
-    thread.start()
+def stop_feeder() -> None:
+    """Stop the feeder motor via ESP."""
+    send_esp_command({"type": "command", "device": "feeder", "action": "stop"})
 
 
 # =============================================================================
@@ -424,12 +382,20 @@ def get_sun_times() -> Tuple[datetime, datetime]:
         sunrise = (
             datetime.fromisoformat(results["sunrise"].replace("Z", "+00:00"))
             .astimezone(LOCAL_TZ)
-            .replace(date=today)
+            .replace(
+                year=today.year,
+                month=today.month,
+                day=today.day
+            )
         )
         sunset = (
             datetime.fromisoformat(results["sunset"].replace("Z", "+00:00"))
             .astimezone(LOCAL_TZ)
-            .replace(date=today)
+            .replace(
+                year=today.year,
+                month=today.month,
+                day=today.day
+            )
         )
 
         # Cache the result
@@ -460,7 +426,7 @@ def get_sun_times() -> Tuple[datetime, datetime]:
         return backup_rise, backup_set
 
 
-def is_door_motor_running() -> bool:
+def is_door_motion_pending() -> bool:
     """
     Check if the door motor is currently running.
     Returns True if either forward or backward pin is active.
@@ -471,22 +437,27 @@ def is_door_motor_running() -> bool:
 def sync_door_status_from_esp() -> Optional[str]:
     """Sync door status in database using ESP-reported switch and door state."""
     if esp_door_state == "fully_open":
-        db_utils.update_device_control(door_status="open")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="open")
         return "open"
 
     if esp_door_state == "fully_closed":
-        db_utils.update_device_control(door_status="closed")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="closed")
         return "closed"
 
-    current = db_utils.fetch_device_control() or {}
+    with DB_LOCK:
+        current = db_utils.fetch_device_control() or {}
     if current.get("door_status") == "timeout":
         return "timeout"
 
     if esp_command_pending:
-        db_utils.update_device_control(door_status="moving")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="moving")
         return "moving"
 
-    db_utils.update_device_control(door_status="inbetween")
+    with DB_LOCK:
+        db_utils.update_device_control(door_status="inbetween")
     return "inbetween"
 
 
@@ -503,22 +474,26 @@ def validate_control_row(row: Optional[dict]) -> bool:
 
     if row.get("door_target") not in VALID_DOOR_TARGETS:
         print(f"[MAIN] Invalid door_target: {row.get('door_target')}")
-        db_utils.update_device_control(door_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="error")
         return False
 
     if row.get("feeder_target") not in VALID_FEEDER_TARGETS:
         print(f"[MAIN] Invalid feeder_target: {row.get('feeder_target')}")
-        db_utils.update_device_control(feeder_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="error")
         return False
 
     if row.get("door_status") not in VALID_DOOR_STATUSES:
         print(f"[MAIN] Invalid door_status: {row.get('door_status')}")
-        db_utils.update_device_control(door_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(door_status="error")
         return False
 
     if row.get("feeder_status") not in VALID_FEEDER_STATUSES:
         print(f"[MAIN] Invalid feeder_status: {row.get('feeder_status')}")
-        db_utils.update_device_control(feeder_status="error")
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_status="error")
         return False
 
     return True
@@ -575,7 +550,8 @@ def apply_door_state(row: dict, door_open_time: datetime, door_close_time: datet
 
     # Update target in DB if auto mode changed the computed state
     if row["door_auto"] and row["door_target"] != desired:
-        db_utils.update_device_control(door_target=desired)
+        with DB_LOCK:
+            db_utils.update_device_control(door_target=desired)
 
     status = row["door_status"]
 
@@ -585,6 +561,9 @@ def apply_door_state(row: dict, door_open_time: datetime, door_close_time: datet
         return
 
     if desired == status:
+        return
+    
+    if status == "moving":
         return
 
     # Move motor to reach desired state
@@ -602,7 +581,8 @@ def apply_feeder_state(row: dict, feeder_open_time: datetime, feeder_close_time:
 
     # Update target in DB if auto mode changed the computed state
     if row["feeder_auto"] and row["feeder_target"] != desired:
-        db_utils.update_device_control(feeder_target=desired)
+        with DB_LOCK:
+            db_utils.update_device_control(feeder_target=desired)
 
     status = row["feeder_status"]
 
@@ -614,6 +594,8 @@ def apply_feeder_state(row: dict, feeder_open_time: datetime, feeder_close_time:
     if desired == status:
         return
 
+    if status == "moving":
+        return
     # Move motor to reach desired state
     if desired == "open":
         feeder_open_thread()

@@ -52,7 +52,7 @@ const float a_NH3 = -2.0;    // placeholder slope
 const float b_NH3 = 0.8;    // placeholder intercept
 
 /************ TIMING ************/
-const uint32_t REPORT_INTERVAL_MS = 5000;
+const uint32_t REPORT_INTERVAL_MS = 1000;
 const uint32_t DHT_INTERVAL_MS = 2500;
 const uint32_t MQ136_SAMPLE_INTERVAL_MS = 500;
 const uint32_t MQ136_WARMUP_MS = 120000;
@@ -65,8 +65,8 @@ const int CO2_MAX_PPM = 5500;
 const uint32_t MQ137_SAMPLE_INTERVAL_MS = 500;
 const uint32_t MQ137_WARMUP_MS = 120000;
 const uint32_t SWITCH_DEBOUNCE_MS = 20;
-const uint32_t DOOR_TIMEOUT_MS = 60000;
-const uint32_t FEEDER_RUN_MS = 8000;
+const uint32_t DOOR_TIMEOUT_MS = 115000;
+const uint32_t FEEDER_RUN_MS = 12000;
 const int FAN_PWM_FREQ = 5000;
 const int FAN_PWM_RESOLUTION = 8;
 
